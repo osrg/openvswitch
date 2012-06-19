@@ -401,27 +401,38 @@ static __be16 check_skb_mpls(struct sk_buff *skb, __be16 protocol, u8 *err)
 	return protocol;
 }
 
-/* Check VLAN/MPLS packets. */
-static __be16 check_skb_vlan_mpls(struct sk_buff *skb, __be16 protocol, u8 *err)
+/* Check for VLAN-QinQ/MPLS or VLAN/MPLS encapsulation. */
+static __be16 check_skb_vlan_qinq_mpls(struct sk_buff *skb, __be16 protocol, u8 *err)
 {
 	__be32 mpls_lse = htonl(0);
 	unsigned int mpls_lse_len = MPLS_HLEN;
+	unsigned int vlan_hlen = 0;
 
-	/* Handle VLAN/MPLS encapsulated packets. */
-	if (protocol == htons(ETH_P_MPLS_UC) ||
-		protocol == htons(ETH_P_MPLS_MC)) {
-		if (unlikely(!pskb_may_pull(skb, MPLS_HLEN))) {
+	/* Handle VLAN-QinQ/MPLS encapsulated packets. */
+	if (protocol == htons(ETH_P_8021Q)) {
+
+		if (unlikely(!pskb_may_pull(skb, VLAN_HLEN + mpls_lse_len))) {
 			*err = 0;
 			return protocol;
 		}
 
-		mpls_lse = *(__be32 *)(skb->data + VLAN_ETH_HLEN);
+		skb_set_network_header(skb, skb_network_offset(skb) + VLAN_HLEN);
+		protocol = *(__be16 *)(skb->data + VLAN_ETH_HLEN + 2);
+		vlan_hlen += VLAN_ETH_HLEN;
+		mpls_lse_len = 0;
+	}
+
+	if (protocol == htons(ETH_P_MPLS_UC) ||
+		protocol == htons(ETH_P_MPLS_MC)) {
+
+		mpls_lse = *(__be32 *)(skb->data + vlan_hlen + mpls_lse_len);
+		mpls_lse_len = MPLS_HLEN;
 		while (!(mpls_lse & htonl(MPLS_STACK_MASK))) {
 			if (unlikely(!pskb_may_pull(skb, mpls_lse_len))) {
 				*err = 0;
 				return protocol;
 			}
-			mpls_lse = *(__be32 *)(skb->data + VLAN_ETH_HLEN + mpls_lse_len);
+			mpls_lse = *(__be32 *)(skb->data + vlan_hlen + mpls_lse_len);
 			mpls_lse_len += MPLS_HLEN;
 		}
 		skb_set_network_header(skb, skb_network_offset(skb) + mpls_lse_len);
@@ -443,15 +454,16 @@ static void ecn_decapsulate(struct sk_buff *skb, u8 tos)
 
 		skb_set_network_header(skb, ETH_HLEN);
 
-		if (protocol == htons(ETH_P_8021Q)) {
+		if (protocol == htons(ETH_P_8021Q) ||
+			protocol == htons(ETH_P_8021AD)) {
 			if (unlikely(!pskb_may_pull(skb, VLAN_ETH_HLEN)))
 				return;
 
 			protocol = vlan_eth_hdr(skb)->h_vlan_encapsulated_proto;
 			skb_set_network_header(skb, VLAN_ETH_HLEN);
 
-			/* Handle VLAN/MPLS encapsulated packets. */
-			protocol = check_skb_vlan_mpls(skb, protocol, &rc);
+			/* Handle VLAN-QinQ/MPLS or VLAN/MPLS encapsulated packets. */
+			protocol = check_skb_vlan_qinq_mpls(skb, protocol, &rc);
 			if (!rc)
 				return;
 		} else {
@@ -517,6 +529,7 @@ void ovs_tnl_rcv(struct vport *vport, struct sk_buff *skb, u8 tos)
 
 	ecn_decapsulate(skb, tos);
 	vlan_set_tci(skb, 0);
+	vlan_set_qinq_tci(skb, 0);
 
 	if (unlikely(compute_ip_summed(skb, false))) {
 		kfree_skb(skb);
@@ -719,7 +732,8 @@ void check_mpls_hlen(struct sk_buff *skb, unsigned int *mpls_hlen)
 }
 
 /* Check VLAN/MPLS packets. Do not modify skb. */
-void check_vlan_mpls_hlen(struct sk_buff *skb, unsigned int *mpls_hlen)
+void check_vlan_qinq_mpls_hlen(struct sk_buff *skb, unsigned int *vlan_hlen,
+								unsigned int *mpls_hlen)
 {
 	__be16 protocol;
 	__be32 mpls_lse = htonl(0);
@@ -739,6 +753,12 @@ void check_vlan_mpls_hlen(struct sk_buff *skb, unsigned int *mpls_hlen)
 	}
 
 	protocol = *(__be16 *)(skb->data + eth_type_len);
+	if (protocol == htons(ETH_P_8021Q)) {
+		*vlan_hlen += VLAN_HLEN;
+		total_hlen += VLAN_HLEN;
+		protocol = *(__be16 *)(skb->data + eth_type_len + VLAN_HLEN);
+	}
+
 	if (protocol == htons(ETH_P_MPLS_UC) ||
 		protocol == htons(ETH_P_MPLS_MC)) {
 		*mpls_hlen += MPLS_HLEN;
@@ -792,10 +812,11 @@ bool ovs_tnl_frag_needed(struct vport *vport,
 		return false;
 
 	/* Allocate */
-	if (old_eh->h_proto == htons(ETH_P_8021Q)) {
+	if (old_eh->h_proto == htons(ETH_P_8021Q) ||
+		old_eh->h_proto == htons(ETH_P_8021AD)) {
 
 		eth_hdr_len = VLAN_ETH_HLEN;
-		check_vlan_mpls_hlen(skb, &mpls_hdr_len);
+		check_vlan_qinq_mpls_hlen(skb, &eth_hdr_len, &mpls_hdr_len);
 	}
 
 	payload_length = skb->len - eth_hdr_len - mpls_hdr_len;
@@ -827,13 +848,16 @@ bool ovs_tnl_frag_needed(struct vport *vport,
 	memcpy(eh->h_dest, old_eh->h_source, ETH_ALEN);
 	memcpy(eh->h_source, mutable->eth_addr, ETH_ALEN);
 	nskb->protocol = eh->h_proto = old_eh->h_proto;
-	if (old_eh->h_proto == htons(ETH_P_8021Q)) {
+	if (old_eh->h_proto == htons(ETH_P_8021Q) ||
+		old_eh->h_proto == htons(ETH_P_8021AD)) {
 		struct vlan_ethhdr *vh = (struct vlan_ethhdr *)eh;
 
 		vh->h_vlan_TCI = vlan_eth_hdr(skb)->h_vlan_TCI;
 		vh->h_vlan_encapsulated_proto = skb->protocol;
-	} else
+	} else {
 		vlan_set_tci(nskb, vlan_get_tci(skb));
+		vlan_set_qinq_tci(nskb, vlan_get_qinq_tci(skb));
+	}
 	skb_reset_mac_header(nskb);
 
 	/* Protocol */
@@ -875,16 +899,17 @@ static bool check_mtu(struct sk_buff *skb,
 	__be16 frag_off = mutable->flags & TNL_F_DF_DEFAULT ? htons(IP_DF) : 0;
 	int mtu = 0;
 	unsigned int packet_length = skb->len - ETH_HLEN;
-	unsigned int mpls_hlen = 0;
+	unsigned int vlan_hlen = 0, mpls_hlen = 0;
 
-	/* Allow for one level of tagging and allow mpls headers
+	/* Allow for two level of tagging and allow mpls headers
 	 * in the packet length. */
 	if (!vlan_tx_tag_present(skb) &&
-	    eth_hdr(skb)->h_proto == htons(ETH_P_8021Q)) {
+	    (eth_hdr(skb)->h_proto == htons(ETH_P_8021Q) ||
+		 eth_hdr(skb)->h_proto == htons(ETH_P_8021AD))) {
 
 		packet_length -= VLAN_HLEN;
-		check_vlan_mpls_hlen(skb, &mpls_hlen);
-		packet_length = packet_length - mpls_hlen;
+		check_vlan_qinq_mpls_hlen(skb, &vlan_hlen, &mpls_hlen);
+		packet_length = packet_length - vlan_hlen - mpls_hlen;
 	}
 
 	check_mpls_hlen(skb, &mpls_hlen);
@@ -897,9 +922,10 @@ static bool check_mtu(struct sk_buff *skb,
 		 * currently is, so subtract it from the MTU.
 		 */
 		if (vlan_tx_tag_present(skb) ||
-		    eth_hdr(skb)->h_proto == htons(ETH_P_8021Q)) {
+			(eth_hdr(skb)->h_proto == htons(ETH_P_8021Q) ||
+			 eth_hdr(skb)->h_proto == htons(ETH_P_8021AD))) {
 			vlan_header = VLAN_HLEN;
-			check_vlan_mpls_hlen(skb, &mpls_header);
+			check_vlan_qinq_mpls_hlen(skb, &vlan_header, &mpls_header);
 		}
 
 		check_mpls_hlen(skb, &mpls_header);
@@ -1241,12 +1267,13 @@ static struct sk_buff *handle_offloads(struct sk_buff *skb,
 {
 	int min_headroom;
 	int err;
-	unsigned int mpls_hlen = 0;
+	unsigned int mpls_hlen = 0, vlan_hlen = 0;
 
-	check_vlan_mpls_hlen(skb, &mpls_hlen);
+	check_vlan_qinq_mpls_hlen(skb, &vlan_hlen, &mpls_hlen);
 	min_headroom = LL_RESERVED_SPACE(rt_dst(rt).dev) + rt_dst(rt).header_len
 			+ mutable->tunnel_hlen
 			+ (vlan_tx_tag_present(skb) ? VLAN_HLEN : 0)
+			+ vlan_hlen
 			+ mpls_hlen;
 
 	if (skb_headroom(skb) < min_headroom || skb_header_cloned(skb)) {
@@ -1265,23 +1292,38 @@ static struct sk_buff *handle_offloads(struct sk_buff *skb,
 		struct sk_buff *nskb;
 		u8 rc = 1;
 
-		if (mpls_tag_present(skb)) {
+		if (mpls_tag_present(skb) || vlan_qinq_tag_present(skb)) {
 			/* skb_gso_segment depends on skb->protocol, save and
 			 * restore after the call. */
 			__be16 tmp_protocol = skb->protocol;
 
 			skb_set_network_header(skb, ETH_HLEN);
 
-			if (unlikely(!pskb_may_pull(skb, ETH_HLEN)))
-				goto error_free;
+			if (skb->protocol == htons(ETH_P_8021Q) ||
+				skb->protocol == htons(ETH_P_8021AD)) {
+				if (unlikely(!pskb_may_pull(skb, VLAN_ETH_HLEN)))
+					goto error_free;
 
-			/* Handle MPLS encapsulated packets. */
-			skb->protocol = check_skb_mpls(skb, skb->protocol, &rc);
-			if (!rc)
-				goto error_free;
+				skb->protocol = vlan_eth_hdr(skb)->h_vlan_encapsulated_proto;
+				skb_set_network_header(skb, VLAN_ETH_HLEN);
 
-            nskb = skb_gso_segment(skb, 0);
-            skb->protocol = tmp_protocol;
+				/* Handle VLAN-QinQ/MPLS or VLAN/MPLS encapsulated packets. */
+				skb->protocol = check_skb_vlan_qinq_mpls(skb, skb->protocol, &rc);
+				if (!rc)
+					goto error_free;
+			} else {
+				if (unlikely(!pskb_may_pull(skb, ETH_HLEN)))
+					goto error_free;
+
+				/* Handle MPLS encapsulated packets. */
+				skb->protocol = check_skb_mpls(skb, skb->protocol, &rc);
+				if (!rc)
+					goto error_free;
+			}
+
+			skb_reset_network_header(skb);
+			nskb = skb_gso_segment(skb, 0);
+			skb->protocol = tmp_protocol;
 		} else {
 			nskb = skb_gso_segment(skb, 0);
 		}
@@ -1370,7 +1412,8 @@ int ovs_tnl_send(struct vport *vport, struct sk_buff *skb)
 	u8 tos, rc;
 
 	/* Validate the protocol headers before we try to use them. */
-	if (skb->protocol == htons(ETH_P_8021Q) &&
+	if ((skb->protocol == htons(ETH_P_8021Q) ||
+		 skb->protocol == htons(ETH_P_8021AD)) &&
 	    !vlan_tx_tag_present(skb)) {
 		if (unlikely(!pskb_may_pull(skb, VLAN_ETH_HLEN)))
 			goto error_free;
@@ -1378,8 +1421,8 @@ int ovs_tnl_send(struct vport *vport, struct sk_buff *skb)
 		skb->protocol = vlan_eth_hdr(skb)->h_vlan_encapsulated_proto;
 		skb_set_network_header(skb, VLAN_ETH_HLEN);
 
-		/* Handle VLAN/MPLS encapsulated packets. */
-		skb->protocol = check_skb_vlan_mpls(skb, skb->protocol, &rc);
+		/* Handle VLAN-QinQ/MPLS or VLAN/MPLS encapsulated packets. */
+		skb->protocol = check_skb_vlan_qinq_mpls(skb, skb->protocol, &rc);
 		if (!rc)
 			goto error_free;
 	} else {
@@ -1477,6 +1520,9 @@ int ovs_tnl_send(struct vport *vport, struct sk_buff *skb)
 		skb->next = NULL;
 
 		if (unlikely(vlan_deaccel_tag(skb)))
+			goto next;
+
+		if (unlikely(vlan_deaccel_qinq_tag(skb)))
 			goto next;
 
 		if (likely(cache)) {

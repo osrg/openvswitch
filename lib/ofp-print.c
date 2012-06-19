@@ -184,6 +184,7 @@ ofp_print_action(struct ds *s, const union ofp_action *a,
     const struct nx_action_output_reg *naor;
     const struct nx_action_fin_timeout *naft;
     const struct nx_action_controller *nac;
+    const struct nx_action_push_vlan *navpush;
     struct mf_subfield subfield;
     uint16_t port;
 
@@ -413,6 +414,11 @@ ofp_print_action(struct ds *s, const union ofp_action *a,
         }
         ds_chomp(s, ',');
         ds_put_char(s, ')');
+        break;
+
+   case OFPUTIL_NXAST_PUSH_VLAN:
+        navpush = (const struct nx_action_push_vlan *) a;
+        ds_put_format(s, "push_vlan:0x%"PRIx16, ntohs(navpush->tpid));
         break;
 
     default:

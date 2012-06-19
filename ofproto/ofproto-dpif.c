@@ -2993,7 +2993,7 @@ ofproto_dpif_extract_flow_key(const struct ofproto_dpif *ofproto,
              * that 'packet' is inside a Netlink attribute: pushing 4 bytes
              * will just overwrite the 4-byte "struct nlattr", which is fine
              * since we don't need that header anymore. */
-            eth_push_vlan(packet, flow->vlan_tci);
+            eth_push_vlan(packet, flow->vlan_tci, htons(ETH_TYPE_VLAN));
         }
 
         /* Let the caller know that we can't reproduce 'key' from 'flow'. */
@@ -4861,6 +4861,7 @@ compose_output_action__(struct action_xlate_ctx *ctx, uint16_t ofp_port,
     const struct ofport_dpif *ofport = get_ofp_port(ctx->ofproto, ofp_port);
     uint16_t odp_port = ofp_port_to_odp_port(ofp_port);
     ovs_be16 flow_vlan_tci = ctx->flow.vlan_tci;
+    ovs_be16 flow_vlan_qinq_tci = ctx->flow.vlan_qinq_tci;
     ovs_be32 flow_mpls_lse = ctx->flow.mpls_lse;
     uint8_t flow_nw_tos = ctx->flow.nw_tos;
     uint16_t out_port;
@@ -4896,6 +4897,7 @@ compose_output_action__(struct action_xlate_ctx *ctx, uint16_t ofp_port,
     ctx->sflow_n_outputs++;
     ctx->nf_output_iface = ofp_port;
     ctx->flow.vlan_tci = flow_vlan_tci;
+    ctx->flow.vlan_qinq_tci = flow_vlan_qinq_tci;
     ctx->flow.mpls_lse = flow_mpls_lse;
     ctx->flow.nw_tos = flow_nw_tos;
 }
@@ -5024,6 +5026,11 @@ execute_controller_action(struct action_xlate_ctx *ctx, int len,
         struct eth_header *eh;
 
         eth_pop_vlan(packet);
+        /* Handle VLAN QinQ packets. */
+        if (ctx->flow.vlan_qinq_tci != htons(0)) {
+            eth_pop_vlan(packet);
+        }
+
         eh = packet->l2;
 
         /* If the Ethernet type is less than ETH_TYPE_MIN, it's likely an 802.2
@@ -5036,7 +5043,11 @@ execute_controller_action(struct action_xlate_ctx *ctx, int len,
         memcpy(eh->eth_dst, ctx->flow.dl_dst, sizeof eh->eth_dst);
 
         if (ctx->flow.vlan_tci & htons(VLAN_CFI)) {
-            eth_push_vlan(packet, ctx->flow.vlan_tci);
+            eth_push_vlan(packet, ctx->flow.vlan_tci, ctx->flow.vlan_tpid);
+        }
+
+        if (ctx->flow.vlan_qinq_tci & htons(VLAN_CFI)) {
+            eth_push_vlan(packet, ctx->flow.vlan_qinq_tci, htons(ETH_TYPE_VLAN));
         }
 
         if (ctx->flow.mpls_lse) {
@@ -5399,6 +5410,7 @@ do_xlate_actions(const union ofp_action *in, size_t n_in,
         const struct nx_action_bundle *nab;
         const struct nx_action_output_reg *naor;
         const struct nx_action_controller *nac;
+        const struct nx_action_push_vlan *navpush;
         enum ofputil_action_code code;
         ovs_be64 tun_id;
         ovs_be32 mpls_label;
@@ -5416,16 +5428,27 @@ do_xlate_actions(const union ofp_action *in, size_t n_in,
         case OFPUTIL_OFPAT10_SET_VLAN_VID:
             ctx->flow.vlan_tci &= ~htons(VLAN_VID_MASK);
             ctx->flow.vlan_tci |= ia->vlan_vid.vlan_vid | htons(VLAN_CFI);
+            if (ctx->flow.vlan_tpid == htons(0)) {
+                ctx->flow.vlan_tpid = htons(ETH_TYPE_VLAN);
+            }
             break;
 
         case OFPUTIL_OFPAT10_SET_VLAN_PCP:
             ctx->flow.vlan_tci &= ~htons(VLAN_PCP_MASK);
             ctx->flow.vlan_tci |= htons(
                 (ia->vlan_pcp.vlan_pcp << VLAN_PCP_SHIFT) | VLAN_CFI);
+            if (ctx->flow.vlan_tpid == htons(0)) {
+                ctx->flow.vlan_tpid = htons(ETH_TYPE_VLAN);
+            }
             break;
 
         case OFPUTIL_OFPAT10_STRIP_VLAN:
-            ctx->flow.vlan_tci = htons(0);
+            if (ctx->flow.vlan_tci != 0) {
+                ctx->flow.vlan_tci = htons(0);
+                ctx->flow.vlan_tpid = htons(0);
+            } else if (ctx->flow.vlan_qinq_tci != 0) {
+                ctx->flow.vlan_qinq_tci = htons(0);
+            }
             break;
 
         case OFPUTIL_OFPAT10_SET_DL_SRC:
@@ -5614,6 +5637,25 @@ do_xlate_actions(const union ofp_action *in, size_t n_in,
             nac = (const struct nx_action_controller *) ia;
             execute_controller_action(ctx, ntohs(nac->max_len), nac->reason,
                                       ntohs(nac->controller_id));
+            break;
+
+        case OFPUTIL_NXAST_PUSH_VLAN:
+            if (ctx->base_flow.vlan_tci != 0) {
+                navpush = (const struct nx_action_push_vlan *) ia;
+                /* For actions configured as
+                 * strip_vlan,push_vlan:0x8100/0x88a8 - Push a new vlan header.
+                 * push_vlan:0x8100/0x88a8,strip_vlan - no-op. */
+                ctx->flow.vlan_tpid = navpush->tpid;
+                if (ctx->flow.vlan_tci != htons(0)) {
+                    ctx->flow.vlan_qinq_tci = ctx->base_flow.vlan_tci;
+                } else {
+                    ctx->flow.vlan_tci = ctx->base_flow.vlan_tci;
+                }
+            } else if (ctx->flow.vlan_tci != htons(0)) {
+                navpush = (const struct nx_action_push_vlan *) ia;
+                ctx->flow.vlan_tpid = navpush->tpid;
+                ctx->flow.vlan_qinq_tci = ctx->flow.vlan_tci;
+            }
             break;
         }
     }
@@ -6233,7 +6275,8 @@ xlate_normal(struct action_xlate_ctx *ctx)
     }
 
     /* Drop malformed frames. */
-    if (ctx->flow.dl_type == htons(ETH_TYPE_VLAN) &&
+    if ((ctx->flow.dl_type == htons(ETH_TYPE_VLAN) ||
+         ctx->flow.dl_type == htons(ETH_TYPE_VLAN_8021AD)) &&
         !(ctx->flow.vlan_tci & htons(VLAN_CFI))) {
         if (ctx->packet != NULL) {
             static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);

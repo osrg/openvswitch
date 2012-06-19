@@ -326,6 +326,7 @@ parse_named_action(enum ofputil_action_code code, const struct flow *flow,
     struct nx_action_mpls_ttl *namttl;
     struct nx_action_push_mpls *nampush;
     struct nx_action_pop_mpls *nampop;
+    struct nx_action_push_vlan *navpush;
 
     switch (code) {
     case OFPUTIL_OFPAT10_OUTPUT:
@@ -479,6 +480,11 @@ parse_named_action(enum ofputil_action_code code, const struct flow *flow,
 
     case OFPUTIL_NXAST_CONTROLLER:
         parse_controller(b, arg);
+        break;
+
+    case OFPUTIL_NXAST_PUSH_VLAN:
+        navpush = ofputil_put_NXAST_PUSH_VLAN(b);
+        navpush->tpid = htons(str_to_u32(arg));
         break;
     }
 }

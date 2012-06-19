@@ -47,10 +47,11 @@ MODULE_PARM_DESC(vlan_tso, "Enable TSO for VLAN packets");
 
 /* Currently MPLS support is not available in kernel, so use the #define
  * to control MPLS offload capability.
- * mpls_tso = 0, use OVS offload simulation.
- * mpls_tso = 1, use Linux kernel generic offload code.
- * MPLS_TSO = undefined, use Linux kernel generic offload code. */
+ * mpls_tso/vlan_qinq_tso = 0, use OVS offload simulation.
+ * mpls_tso/vlan_qinq_tso = 1, use Linux kernel generic offload code.
+ * MPLS_TSO/VLAN_QINQ_TSO = undefined, use Linux kernel generic offload code. */
 #define  MPLS_TSO         true
+#define  VLAN_QINQ_TSO    true
 
 #ifdef MPLS_TSO
 #include <linux/module.h>
@@ -60,6 +61,16 @@ module_param(mpls_tso, int, 0644);
 MODULE_PARM_DESC(mpls_tso, "Enable TSO for MPLS packets");
 #else
 #define mpls_tso true
+#endif
+
+#ifdef VLAN_QINQ_TSO
+#include <linux/module.h>
+
+static int vlan_qinq_tso __read_mostly;
+module_param(vlan_qinq_tso, int, 0644);
+MODULE_PARM_DESC(vlan_qinq_tso, "Enable TSO for VLAN QinQ packets");
+#else
+#define vlan_qinq_tso true
 #endif
 
 static void netdev_port_receive(struct vport *vport, struct sk_buff *skb);
@@ -293,14 +304,15 @@ static void netdev_port_receive(struct vport *vport, struct sk_buff *skb)
 static unsigned int packet_length(struct sk_buff *skb)
 {
 	unsigned int length = skb->len - ETH_HLEN;
-	unsigned int mpls_hlen = 0;
+	unsigned int mpls_hlen = 0, vlan_hlen = 0;
 
-	if (skb->protocol == htons(ETH_P_8021Q)) {
+	if (skb->protocol == htons(ETH_P_8021Q) ||
+		skb->protocol == htons(ETH_P_8021AD)) {
 
 		length -= VLAN_HLEN;
-		/* Handle VLAN/MPLS encapsulated packets. */
-        check_vlan_mpls_hlen(skb, &mpls_hlen);
-		length -= mpls_hlen;
+		/* Handle VLAN-QinQ/MPLS or VLAN/MPLS encapsulated packets. */
+		check_vlan_qinq_mpls_hlen(skb, &vlan_hlen, &mpls_hlen);
+		length = length - mpls_hlen - vlan_hlen;
 	} else {
 		/* Handle MPLS encapsulated packets. */
 		check_mpls_hlen(skb, &mpls_hlen);
@@ -321,6 +333,34 @@ static bool dev_supports_vlan_tx(struct net_device *dev)
 	/* Assume that the driver is buggy. */
 	return false;
 #endif
+}
+
+/* Check for VLAN QinQ header present. */
+bool vlan_qinq_tag_present(struct sk_buff *skb)
+{
+#ifdef VLAN_QINQ_TSO
+	__be16 protocol = htons(0);
+
+	if (unlikely(!pskb_may_pull(skb, 2 * ETH_ALEN + VLAN_HLEN)))
+		return false;
+
+	if (vlan_tx_tag_present(skb)) {
+		if (vlan_tx_qinq_tag_present(skb)) {
+			return true;
+		} else {
+			protocol = *(__be16*)(skb->data + 2 * ETH_ALEN);
+			if (protocol == htons(ETH_P_8021Q)) {
+				return true;
+			}
+		}
+	} else if (skb->protocol == htons(ETH_P_8021Q) ||
+			   skb->protocol == htons(ETH_P_8021AD)) {
+		protocol = *(__be16 *)(skb->data + 2 * ETH_ALEN + VLAN_HLEN);
+		if (protocol == htons(ETH_P_8021Q))
+			return true;
+	}
+#endif
+	return false;
 }
 
 /* Check for MPLS header presence. */
@@ -344,14 +384,15 @@ bool mpls_tag_present(struct sk_buff *skb)
 	return false;
 }
 
-/* Get protocol after MPLS or VLAN/MPLS header. */
-void check_skb_vlan_mpls_protocol(struct sk_buff *skb)
+/* Get protocol after MPLS or VLAN/MPLS or VLAN-QinQ/MPLS header. */
+void check_skb_vlan_qinq_mpls_protocol(struct sk_buff *skb)
 {
 	int vlan_depth = ETH_HLEN;
 	int vlan_hlen = 0;
 
 	/* Handle MPLS, VLAN/MPLS and VLAN-QinQ/MPLS encapsulated packets. */
-	while (skb->protocol == htons(ETH_P_8021Q)) {
+	while (skb->protocol == htons(ETH_P_8021Q) ||
+		   skb->protocol == htons(ETH_P_8021AD)) {
 		struct vlan_hdr *vh;
 
 		if (unlikely(!pskb_may_pull(skb, vlan_depth + VLAN_HLEN))) {
@@ -387,8 +428,8 @@ static int netdev_send(struct vport *vport, struct sk_buff *skb)
 {
 	struct netdev_vport *netdev_vport = netdev_vport_priv(vport);
 	int mtu = netdev_vport->dev->mtu;
-	int len;
-	bool mpls_tag;
+	int len = 0;
+	bool mpls_tag, vlan_qinq_tag;
 
 	if (unlikely(packet_length(skb) > mtu && !skb_is_gso(skb))) {
 		net_warn_ratelimited("%s: dropped over-mtu packet: %d > %d\n",
@@ -404,9 +445,10 @@ static int netdev_send(struct vport *vport, struct sk_buff *skb)
 	forward_ip_summed(skb, true);
 
 	mpls_tag = mpls_tag_present(skb) && !mpls_tso;
+	vlan_qinq_tag = vlan_qinq_tag_present(skb) && !vlan_qinq_tso;
 
-	/* Handle MPLS and VLAN packets(for kernel < 2.6.37). */
-	if (mpls_tag ||
+	/* Handle MPLS, VLAN QinQ and VLAN packets(for kernel < 2.6.37). */
+	if (mpls_tag || vlan_qinq_tag ||
 		(vlan_tx_tag_present(skb) && !dev_supports_vlan_tx(skb->dev))) {
 		int features;
 
@@ -415,7 +457,7 @@ static int netdev_send(struct vport *vport, struct sk_buff *skb)
 		if (vlan_tx_tag_present(skb) && !vlan_tso) {
 			features &= ~(NETIF_F_TSO | NETIF_F_TSO6 |
 						  NETIF_F_UFO | NETIF_F_FSO);
-		} else if (mpls_tag) {
+		} else if (mpls_tag || vlan_qinq_tag) {
 			features &= ~(NETIF_F_TSO | NETIF_F_TSO6 |
 						  NETIF_F_UFO | NETIF_F_FSO | NETIF_F_ALL_CSUM);
 		}
@@ -423,11 +465,11 @@ static int netdev_send(struct vport *vport, struct sk_buff *skb)
 		if (netif_needs_gso(skb, features)) {
 			struct sk_buff *nskb;
 
-			if (mpls_tag) {
+			if (mpls_tag || vlan_qinq_tag) {
 				/* skb_gso_segment depends on skb->protocol, save and
 				 * restore after the call. */
 				__be16 tmp_protocol = skb->protocol;
-				check_skb_vlan_mpls_protocol(skb);
+				check_skb_vlan_qinq_mpls_protocol(skb);
 				nskb = skb_gso_segment(skb, features);
 				skb->protocol = tmp_protocol;
 			} else {
@@ -456,12 +498,17 @@ static int netdev_send(struct vport *vport, struct sk_buff *skb)
 				nskb = skb->next;
 				skb->next = NULL;
 
-				/* VLAN packets (kernel < 2.6.37) or VLAN/MPLS packets. */
+				/* VLAN packets (kernel < 2.6.37) or VLAN/MPLS packets
+				 * or VLAN QinQ packets. */
 				if (vlan_tx_tag_present(skb)) {
-					skb = __vlan_put_tag(skb, vlan_tx_tag_get(skb));
+					if (vlan_get_tpid(skb) == htons(ETH_P_8021AD))
+						skb = __vlan_put_qinq_tag(skb, vlan_tx_tag_get(skb));
+					else
+						skb = __vlan_put_tag(skb, vlan_tx_tag_get(skb));
 					if (likely(skb)) {
 						len += skb->len;
 						vlan_set_tci(skb, 0);
+						vlan_set_qinq_tci(skb, 0);
 						dev_queue_xmit(skb);
 					}
 				} else {
@@ -476,7 +523,7 @@ static int netdev_send(struct vport *vport, struct sk_buff *skb)
 			} while (skb);
 
 			return len;
-		} else if (mpls_tag &&
+		} else if ((mpls_tag || vlan_qinq_tag) &&
 				   get_ip_summed(skb) == OVS_CSUM_PARTIAL) {
 			int err;
 			/* Linearize skb before calculating checksum. */
@@ -488,12 +535,17 @@ static int netdev_send(struct vport *vport, struct sk_buff *skb)
 		}
 
 tag:
-		/* VLAN packets (kernel < 2.6.37) or VLAN/MPLS packets. */
+		/* VLAN packets (kernel < 2.6.37) or VLAN/MPLS packets
+		 * or VLAN QinQ packets. */
 		if (vlan_tx_tag_present(skb)) {
-			skb = __vlan_put_tag(skb, vlan_tx_tag_get(skb));
+			if (vlan_get_tpid(skb) == htons(ETH_P_8021AD))
+				skb = __vlan_put_qinq_tag(skb, vlan_tx_tag_get(skb));
+			else
+				skb = __vlan_put_tag(skb, vlan_tx_tag_get(skb));
 			if (unlikely(!skb))
 				return 0;
 			vlan_set_tci(skb, 0);
+			vlan_set_qinq_tci(skb, 0);
 		}
 	}
 

@@ -168,6 +168,11 @@ ofp_print_action(struct ds *s, const union ofp_action *a,
 {
     const struct ofp_action_enqueue *oae;
     const struct ofp_action_dl_addr *oada;
+    const struct nx_action_mpls_label *naml;
+    const struct nx_action_push_mpls *nampush;
+    const struct nx_action_pop_mpls  *nampop;
+    const struct nx_action_mpls_tc  *namtc;
+    const struct nx_action_mpls_ttl  *namttl;
     const struct nx_action_set_tunnel64 *nast64;
     const struct nx_action_set_tunnel *nast;
     const struct nx_action_set_queue *nasq;
@@ -335,6 +340,43 @@ ofp_print_action(struct ds *s, const union ofp_action *a,
 
     case OFPUTIL_NXAST_DEC_TTL:
         ds_put_cstr(s, "dec_ttl");
+        break;
+
+    case OFPUTIL_NXAST_SET_MPLS_LABEL:
+        naml = (const struct nx_action_mpls_label *) a;
+        ds_put_format(s, "set_mpls_label:%"PRIu32, ntohl(naml->mpls_label));
+        break;
+
+    case OFPUTIL_NXAST_SET_MPLS_TC:
+        namtc = (const struct nx_action_mpls_tc *) a;
+        ds_put_format(s, "set_mpls_tc:%"PRIu8, namtc->mpls_tc);
+        break;
+
+    case OFPUTIL_NXAST_SET_MPLS_TTL:
+        namttl = (const struct nx_action_mpls_ttl *) a;
+        ds_put_format(s, "set_mpls_ttl:%"PRIu8, namttl->mpls_ttl);
+        break;
+
+    case OFPUTIL_NXAST_DEC_MPLS_TTL:
+        ds_put_cstr(s, "dec_mpls_ttl");
+        break;
+
+    case OFPUTIL_NXAST_COPY_TTL_IN:
+        ds_put_cstr(s, "copy_ttl_in");
+        break;
+
+    case OFPUTIL_NXAST_COPY_TTL_OUT:
+        ds_put_cstr(s, "copy_ttl_out");
+        break;
+
+   case OFPUTIL_NXAST_PUSH_MPLS:
+        nampush = (const struct nx_action_push_mpls *) a;
+        ds_put_format(s, "push_mpls:0x%"PRIx16, ntohs(nampush->ethertype));
+        break;
+
+    case OFPUTIL_NXAST_POP_MPLS:
+        nampop = (const struct nx_action_pop_mpls *) a;
+        ds_put_format(s, "pop_mpls:0x%"PRIx16, ntohs(nampop->ethertype));
         break;
 
     case OFPUTIL_NXAST_EXIT:
@@ -861,6 +903,10 @@ ofp10_match_to_string(const struct ofp10_match *om, int verbosity)
             }
         } else if (om->dl_type == htons(ETH_TYPE_ARP)) {
             ds_put_cstr(&f, "arp,");
+        } else if (om->dl_type == htons(ETH_TYPE_MPLS)) {
+            ds_put_cstr(&f, "mpls,");
+        } else if (om->dl_type == htons(ETH_TYPE_MPLS_MCAST)) {
+            ds_put_cstr(&f, "mplsm,");
         } else {
             skip_type = false;
         }

@@ -479,6 +479,26 @@ static int parse_vlan(struct sk_buff *skb, struct sw_flow_key *key)
 	return 0;
 }
 
+static int parse_mpls(struct sk_buff *skb, struct sw_flow_key *key)
+{
+	struct mtag_prefix {
+		__be32 mpls_lse;
+	};
+	struct mtag_prefix *mp;
+
+	if (unlikely(skb->len < sizeof(struct mtag_prefix)))
+		return 0;
+
+	if (unlikely(!pskb_may_pull(skb, sizeof(struct mtag_prefix))))
+		return -ENOMEM;
+
+	mp = (struct mtag_prefix *) skb->data;
+	key->mpls.mpls_lse = mp->mpls_lse;
+	__skb_pull(skb, sizeof(struct mtag_prefix));
+
+	return 0;
+}
+
 static __be16 parse_ethertype(struct sk_buff *skb)
 {
 	struct llc_snap_hdr {
@@ -612,7 +632,8 @@ out:
  *    - skb->mac_header: the Ethernet header.
  *
  *    - skb->network_header: just past the Ethernet header, or just past the
- *      VLAN header, to the first byte of the Ethernet payload.
+ *      VLAN header, or just past MPLS shim header to the first byte of the
+ *      Ethernet payload.
  *
  *    - skb->transport_header: If key->dl_type is ETH_P_IP or ETH_P_IPV6
  *      on output, then just past the IP header, if one is present and
@@ -652,6 +673,13 @@ int ovs_flow_extract(struct sk_buff *skb, u16 in_port, struct sw_flow_key *key,
 	key->eth.type = parse_ethertype(skb);
 	if (unlikely(key->eth.type == htons(0)))
 		return -ENOMEM;
+
+	if (key->eth.type == htons(ETH_P_MPLS_UC) ||
+	    key->eth.type == htons(ETH_P_MPLS_MC)) {
+		if (unlikely(parse_mpls(skb, key)))
+			return -ENOMEM;
+		key_len = SW_FLOW_KEY_OFFSET(mpls.mpls_lse);
+	}
 
 	skb_reset_network_header(skb);
 	__skb_push(skb, skb->data - skb_mac_header(skb));
@@ -844,6 +872,7 @@ const int ovs_key_lens[OVS_KEY_ATTR_MAX + 1] = {
 	[OVS_KEY_ATTR_ICMPV6] = sizeof(struct ovs_key_icmpv6),
 	[OVS_KEY_ATTR_ARP] = sizeof(struct ovs_key_arp),
 	[OVS_KEY_ATTR_ND] = sizeof(struct ovs_key_nd),
+	[OVS_KEY_ATTR_MPLS] = sizeof(__be32),
 
 	/* Not upstream. */
 	[OVS_KEY_ATTR_TUN_ID] = sizeof(__be64),
@@ -1076,6 +1105,22 @@ int ovs_flow_from_nlattrs(struct sw_flow_key *swkey, int *key_lenp,
 		swkey->eth.type = htons(ETH_P_802_2);
 	}
 
+	if (swkey->eth.type == htons(ETH_P_MPLS_UC) ||
+	    swkey->eth.type == htons(ETH_P_MPLS_MC)) {
+		__be32 mpls_lse;
+
+		if (!(attrs & (1 << OVS_KEY_ATTR_MPLS))) {
+			return -EINVAL;
+		}
+		mpls_lse = nla_get_be32(a[OVS_KEY_ATTR_MPLS]);
+		if (mpls_lse & htonl(MPLS_LABEL_MASK | MPLS_TC_MASK)) {
+			swkey->mpls.mpls_lse = mpls_lse;
+		}
+		attrs &= ~(1 << OVS_KEY_ATTR_MPLS);
+
+		key_len = SW_FLOW_KEY_OFFSET(mpls.mpls_lse);
+	}
+
 	if (swkey->eth.type == htons(ETH_P_IP)) {
 		const struct ovs_key_ipv4 *ipv4_key;
 
@@ -1241,6 +1286,13 @@ int ovs_flow_to_nlattrs(const struct sw_flow_key *swkey, struct sk_buff *skb)
 
 	if (nla_put_be16(skb, OVS_KEY_ATTR_ETHERTYPE, swkey->eth.type))
 		goto nla_put_failure;
+
+	if (swkey->eth.type == htons(ETH_P_MPLS_UC) ||
+		swkey->eth.type == htons(ETH_P_MPLS_MC)) {
+		if (nla_put_be32(skb, OVS_KEY_ATTR_MPLS, swkey->mpls.mpls_lse)) {
+			goto nla_put_failure;
+		}
+	}
 
 	if (swkey->eth.type == htons(ETH_P_IP)) {
 		struct ovs_key_ipv4 *ipv4_key;

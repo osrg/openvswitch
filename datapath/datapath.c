@@ -664,10 +664,19 @@ static int validate_actions(const struct nlattr *attr,
 			[OVS_ACTION_ATTR_USERSPACE] = (u32)-1,
 			[OVS_ACTION_ATTR_PUSH_VLAN] = sizeof(struct ovs_action_push_vlan),
 			[OVS_ACTION_ATTR_POP_VLAN] = 0,
+			[OVS_ACTION_ATTR_PUSH_MPLS] = sizeof(__be16),
+			[OVS_ACTION_ATTR_POP_MPLS] = sizeof(__be16),
+			[OVS_ACTION_ATTR_SET_MPLS_LSE] = sizeof(__be32),
+			[OVS_ACTION_ATTR_DEC_MPLS_TTL] = 0,
+			[OVS_ACTION_ATTR_COPY_TTL_IN] = 0,
+			[OVS_ACTION_ATTR_COPY_TTL_OUT] = 0,
 			[OVS_ACTION_ATTR_SET] = (u32)-1,
 			[OVS_ACTION_ATTR_SAMPLE] = (u32)-1
 		};
 		const struct ovs_action_push_vlan *vlan;
+		__be16 push_ethertype;
+		__be16 pop_ethertype;
+		__be32 mpls_lse;
 		int type = nla_type(a);
 
 		if (type > OVS_ACTION_ATTR_MAX ||
@@ -700,6 +709,32 @@ static int validate_actions(const struct nlattr *attr,
 				return -EINVAL;
 			if (!(vlan->vlan_tci & htons(VLAN_TAG_PRESENT)))
 				return -EINVAL;
+			break;
+
+		case OVS_ACTION_ATTR_PUSH_MPLS:
+			push_ethertype = nla_get_be16(a);
+			if (push_ethertype != htons(ETH_P_MPLS_UC) &&
+				push_ethertype != htons(ETH_P_MPLS_MC))
+				return -EINVAL;
+			break;
+
+		case OVS_ACTION_ATTR_POP_MPLS:
+			pop_ethertype = nla_get_be16(a);
+			if (pop_ethertype == htons(ETH_P_MPLS_UC) ||
+				pop_ethertype == htons(ETH_P_MPLS_MC))
+				return -EINVAL;
+			break;
+
+		case OVS_ACTION_ATTR_SET_MPLS_LSE:
+			mpls_lse = nla_get_be32(a);
+			if (mpls_lse == htonl(0)) {
+				return -EINVAL;
+			}
+			break;
+
+		case OVS_ACTION_ATTR_DEC_MPLS_TTL:
+		case OVS_ACTION_ATTR_COPY_TTL_IN:
+		case OVS_ACTION_ATTR_COPY_TTL_OUT:
 			break;
 
 		case OVS_ACTION_ATTR_SET:

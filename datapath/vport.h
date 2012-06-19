@@ -249,6 +249,11 @@ static inline struct vport *vport_from_priv(const void *priv)
 
 void ovs_vport_receive(struct vport *, struct sk_buff *);
 void ovs_vport_record_error(struct vport *, enum vport_err_type err_type);
+void check_vlan_mpls_hlen(struct sk_buff *skb, unsigned int *mpls_hlen);
+void check_mpls_hlen(struct sk_buff *skb, unsigned int *mpls_hlen);
+void check_skb_vlan_mpls_protocol(struct sk_buff *skb);
+bool mpls_tag_present(struct sk_buff *skb);
+
 
 /* List of statically compiled vport implementations.  Don't forget to also
  * add yours to the list at the top of vport.c. */
